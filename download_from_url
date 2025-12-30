@@ -1,0 +1,264 @@
+import folder_paths
+import requests
+import urllib.parse
+import os
+import hashlib
+import time
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+import mimetypes
+import json
+import traceback
+
+class DownloadFromURL:
+    """
+    从URL下载文件到ComfyUI缓存目录的节点
+    支持重试机制和进度跟踪
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {
+                    "multiline": False,
+                    "default": ""
+                }),
+            },
+            "optional": {
+                "max_retries": ("INT", {
+                    "default": 3,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "display": "slider"
+                }),
+                "retry_delay": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.5,
+                    "max": 10.0,
+                    "step": 0.5,
+                    "display": "slider"
+                }),
+                "timeout": ("INT", {
+                    "default": 30,
+                    "min": 5,
+                    "max": 120,
+                    "step": 5,
+                    "display": "slider"
+                }),
+                "filename_override": ("STRING", {
+                    "multiline": False,
+                    "default": ""
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    FUNCTION = "download_file"
+    CATEGORY = "utils/download"
+    
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        # 确保缓存目录存在
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+    def _generate_filename(self, url: str, response_headers: dict, override_name: str = "") -> str:
+        """生成文件名"""
+        if override_name and override_name.strip():
+            return override_name.strip()
+        
+        # 尝试从URL中提取文件名
+        parsed_url = urlparse(url)
+        url_path = parsed_url.path
+        if url_path:
+            basename = os.path.basename(url_path)
+            if basename:
+                return basename
+        
+        # 尝试从Content-Disposition头获取文件名
+        if 'content-disposition' in response_headers:
+            content_disposition = response_headers['content-disposition']
+            if 'filename=' in content_disposition:
+                filename = content_disposition.split('filename=')[1].strip('"\'')
+                if filename:
+                    return filename
+        
+        # 根据内容类型生成扩展名
+        content_type = response_headers.get('content-type', '').split(';')[0]
+        extension = mimetypes.guess_extension(content_type) or '.bin'
+        
+        # 使用URL的哈希值作为文件名
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        return f"downloaded_{url_hash}{extension}"
+    
+    def _download_with_retry(self, url: str, max_retries: int = 3, retry_delay: float = 2.0, timeout: int = 30) -> tuple[Optional[bytes], dict]:
+        """带重试机制的下载函数"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"下载尝试 {attempt + 1}/{max_retries}: {url}")
+                
+                # 使用stream模式以便处理大文件
+                response = requests.get(
+                    url, 
+                    headers=headers, 
+                    timeout=timeout,
+                    stream=True,
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                
+                # 收集响应头
+                response_headers = dict(response.headers)
+                
+                # 读取内容
+                content = b""
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        content += chunk
+                        downloaded += len(chunk)
+                        
+                        # 显示进度
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            if attempt % 10 == 0:  # 每10个chunk更新一次
+                                print(f"下载进度: {percent:.1f}% ({downloaded}/{total_size} bytes)")
+                
+                print(f"下载成功: {len(content)} 字节")
+                return content, response_headers
+                
+            except requests.exceptions.Timeout:
+                print(f"尝试 {attempt + 1} 超时，{retry_delay}秒后重试...")
+            except requests.exceptions.ConnectionError as e:
+                print(f"尝试 {attempt + 1} 连接错误: {e}，{retry_delay}秒后重试...")
+            except requests.exceptions.HTTPError as e:
+                print(f"尝试 {attempt + 1} HTTP错误: {e}")
+                # 如果是4xx错误，不需要重试
+                if response.status_code >= 400 and response.status_code < 500:
+                    break
+            except Exception as e:
+                print(f"尝试 {attempt + 1} 发生错误: {e}")
+            
+            # 不是最后一次尝试，等待后重试
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 1.5  # 指数退避
+        
+        return None, {}
+    
+    def download_file(self, url: str, max_retries: int = 3, retry_delay: float = 2.0, timeout: int = 30, filename_override: str = ""):
+        """主下载函数"""
+        
+        if not url or not url.strip():
+            raise ValueError("URL不能为空")
+        
+        # 验证URL格式
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise ValueError(f"无效的URL格式: {url}")
+        
+        print(f"开始下载: {url}")
+        print(f"重试设置: max_retries={max_retries}, retry_delay={retry_delay}s, timeout={timeout}s")
+        
+        # 下载文件
+        content, headers = self._download_with_retry(url, max_retries, retry_delay, timeout)
+        
+        if content is None:
+            raise Exception(f"下载失败，已重试{max_retries}次: {url}")
+        
+        # 生成文件名
+        filename = self._generate_filename(url, headers, filename_override)
+        
+        # 确保文件名安全
+        filename = "".join(c for c in filename if c.isalnum() or c in '._- ')
+        if not filename:
+            filename = f"downloaded_{int(time.time())}"
+        
+        # 保存文件
+        file_path = os.path.join(self.output_dir, filename)
+        
+        # 避免文件名冲突
+        counter = 1
+        original_file_path = file_path
+        while os.path.exists(file_path):
+            name, ext = os.path.splitext(original_file_path)
+            file_path = f"{name}_{counter}{ext}"
+            counter += 1
+        
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(content)
+            
+            # 验证文件大小
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                os.remove(file_path)
+                raise Exception("下载的文件为空")
+            
+            print(f"文件保存成功: {file_path} ({file_size} 字节)")
+            
+            # 记录下载信息
+            self._save_download_info(url, file_path, headers)
+            
+            return (file_path,)
+            
+        except Exception as e:
+            # 清理可能创建的不完整文件
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            raise Exception(f"保存文件失败: {e}")
+    
+    def _save_download_info(self, url: str, file_path: str, headers: dict):
+        """保存下载信息到JSON文件，便于调试"""
+        info = {
+            "url": url,
+            "file_path": file_path,
+            "downloaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "file_size": os.path.getsize(file_path),
+            "headers": {k: v for k, v in headers.items() if k.lower() not in ['set-cookie', 'authorization']}
+        }
+        
+        info_file = os.path.join(self.output_dir, "download_history.json")
+        history = []
+        
+        # 读取现有历史
+        if os.path.exists(info_file):
+            try:
+                with open(info_file, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except:
+                pass
+        
+        # 添加新记录（限制历史长度）
+        history.append(info)
+        if len(history) > 100:  # 保留最近100条记录
+            history = history[-100:]
+        
+        # 保存历史
+        try:
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+
+
+# 节点注册
+NODE_CLASS_MAPPINGS = {
+    "DownloadFromURL": DownloadFromURL
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DownloadFromURL": "下载文件从URL"
+}
